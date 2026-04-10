@@ -18,8 +18,8 @@ IS_HPC = os.path.exists("/scratch/cse/phd/csz258233")
 if IS_HPC:
     # HPC PATHS
     env_site_packages = "/scratch/cse/phd/csz258233/py39_env/lib/python3.9/site-packages"
-    PROJECT_ROOT = "/scratch/cse/phd/csz258233/col7560"
-    SOURCE_PCAP_DIR = "/scratch/cse/phd/csz258233/pcaps"
+    PROJECT_ROOT = "/scratch/cse/phd/csz258233/col7560/et-bert"
+    SOURCE_PCAP_DIR = "/scratch/cse/phd/csz258233/col7560/et-bert/pcaps"
     # For HPC, use tcpdump because mono is usually missing
     SPLIT_COMMAND_TEMPLATE = "tcpdump -r {input} -w {output}/session -C 100"
 else:
