@@ -24,6 +24,20 @@ word_dir = "corpora/"
 word_name = "encrypted_burst.txt"
 splitcap_exe = "tools/SplitCap.exe" 
 
+def maximize_file_limits():
+    try:
+        # Get the system-defined limits
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        
+        # Set the current session's limit to the absolute maximum allowed
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        
+        new_soft, new_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        print(f" Open file limit maximized: {new_soft}")
+    except Exception as e:
+        print(f"Warning: Could not maximize limits: {e}")
+        
+
 def cut(obj, sec):
     """Slices hex strings into n-gram chunks"""
     if not obj: return []
@@ -157,6 +171,7 @@ def pretrain_dataset_generation(pcap_path):
     print(f"Finished! Corpus saved to {word_dir}{word_name}")
 
 if __name__ == '__main__':
+    maximize_file_limits()
     # Make sure your 182GB file is in a folder named 'pcap'
     source_pcap_folder = "pcap/" 
     pretrain_dataset_generation(source_pcap_folder)
