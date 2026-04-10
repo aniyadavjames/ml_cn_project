@@ -1,0 +1,5 @@
+pcaps/
+dataset/
+corpora/
+*.pcap
+*.pcapng
