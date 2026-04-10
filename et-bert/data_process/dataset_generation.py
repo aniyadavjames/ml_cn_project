@@ -7,7 +7,6 @@ import shutil
 import binascii
 import random
 import json
-import tqdm
 import resource
 from multiprocessing import Pool, cpu_count
 
@@ -20,23 +19,19 @@ if IS_HPC:
     env_site_packages = "/scratch/cse/phd/csz258233/py39_env/lib/python3.9/site-packages"
     PROJECT_ROOT = "/scratch/cse/phd/csz258233/col7560/et-bert"
     SOURCE_PCAP_DIR = "/scratch/cse/phd/csz258233/col7560/et-bert/pcaps"
-    # For HPC, use tcpdump because mono is usually missing
+    # HPC usually lacks mono; tcpdump is the reliable heavy-lifter
     SPLIT_COMMAND_TEMPLATE = "tcpdump -r {input} -w {output}/session -C 100"
 else:
-    # LOCAL PATHS (Change these to match your personal computer)
-    env_site_packages = None # Local env is usually handled by conda/venv automatically
-    PROJECT_ROOT = os.getcwd() # Uses the folder where the script is
+    # LOCAL PATHS
+    env_site_packages = None 
+    PROJECT_ROOT = os.getcwd() 
     SOURCE_PCAP_DIR = os.path.join(PROJECT_ROOT, "pcap")
-    # For Local, use SplitCap.exe if you are on Windows, or tcpdump if on Mac/Linux
+    # Using 10MB chunks for local testing to see results faster
     SPLIT_COMMAND_TEMPLATE = "tcpdump -r {input} -w {output}/session -C 10" 
 
 # Add custom environment to path if on HPC
 if IS_HPC and env_site_packages and env_site_packages not in sys.path:
     sys.path.insert(0, env_site_packages)
-
-# Now safe to import network libraries
-import scapy.all as scapy
-from flowcontainer.extractor import extract
 
 # Global Constants
 OUTPUT_BASE = os.path.join(PROJECT_ROOT, "dataset/splitcap")
@@ -51,8 +46,7 @@ def maximize_file_limits():
     """Optimizes system for high-concurrency file reading"""
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        # On local machines, 'hard' might be small; on HPC it's large.
-        # We set soft to hard to avoid ValueError.
+        # Set soft to hard to handle thousands of session files on HPC
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
         new_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
         if IS_HPC: print(f"DEBUG: File limits maximized to {new_soft}")
@@ -86,13 +80,16 @@ def bigram_generation(packet_datagram, packet_len=64):
 # --- 3. PROCESSING FUNCTIONS ---
 
 def split_cap_logic(full_path, pcap_name):
-    """Handles the splitting phase based on the template in config"""
+    """Handles the splitting phase with a duplicate check"""
     output_path = os.path.join(OUTPUT_BASE, pcap_name)
     os.makedirs(output_path, exist_ok=True)
     
-    # Fill the template with actual paths
+    # Check if files already exist to skip re-splitting (saves hours on HPC)
+    if any("session" in f for f in os.listdir(output_path)):
+        print(f"DEBUG: {pcap_name} already split. Skipping to extraction.")
+        return output_path
+
     cmd = SPLIT_COMMAND_TEMPLATE.format(input=full_path, output=output_path)
-    
     print(f"🛠️  Splitting: {os.path.basename(full_path)}")
     exit_code = os.system(cmd)
     
@@ -102,6 +99,10 @@ def split_cap_logic(full_path, pcap_name):
 
 def get_burst_feature_worker(args):
     """Worker function for parallel core usage"""
+    # Import inside worker to ensure each process has proper context
+    import scapy.all as scapy
+    from flowcontainer.extractor import extract
+    
     label_pcap, payload_len = args
     burst_txt = ""
     
@@ -160,7 +161,7 @@ def pretrain_dataset_generation(pcap_path):
     os.makedirs(CORPUS_DIR, exist_ok=True)
 
     print(f"--- Mode: {'HPC' if IS_HPC else 'LOCAL'} ---")
-    print(f"DEBUG: Scanning Source: {pcap_path}")
+    print(f"DEBUG: Project Root: {PROJECT_ROOT}")
     
     pcap_files = []
     for _parent, _dirs, files in os.walk(pcap_path):
@@ -182,16 +183,17 @@ def pretrain_dataset_generation(pcap_path):
     task_list = []
     for root, _, files in os.walk(OUTPUT_BASE):
         for f in files:
-            # Matches 'session', 'session0', etc. from tcpdump
             if 'session' in f:
                 task_list.append((os.path.join(root, f), 64))
 
     # Phase 3: Parallel Process
     if task_list:
         with Pool(processes=cpu_count()) as pool:
+            # imap_unordered is memory efficient for large datasets
             results = pool.imap_unordered(get_burst_feature_worker, task_list)
             
             output_file = os.path.join(CORPUS_DIR, WORD_NAME)
+            # Use 'a' to append so we don't wipe data on job restarts
             with open(output_file, 'a') as f:
                 for res in results:
                     if res: f.write(res)
