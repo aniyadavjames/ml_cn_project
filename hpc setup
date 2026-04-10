@@ -1,0 +1,132 @@
+working with hpc
+
+#Check your Project Groups
+groups
+
+groups
+csz25 HPCenabled phd
+
+
+qstat -P | grep col7560
+
+
+echo $SCRATCH
+/scratch/cse/phd/csz258233
+
+
+
+# Create the directory using the variable
+mkdir -p $SCRATCH
+
+# Jump into it
+cd $SCRATCH
+
+# Confirm you are there
+pwd
+
+
+
+
+export http_proxy=http://proxy61.iitd.ac.in:3128
+export https_proxy=http://proxy61.iitd.ac.in:3128
+
+
+
+module load python/3.10.4  # Or whichever version you prefer
+
+
+git init
+git remote add origin https://github.com/aniyadavjames/ml_cn_project.git
+git pull origin main
+
+
+# Force the creation using the JAX_MD binary
+/home/apps/centos7/JAX_MD/bin/python3 -m venv ~/col7560/venv
+
+# Activate and verify
+source ~/col7560/venv/bin/activate
+python3 --version
+
+
+
+export LD_LIBRARY_PATH=/usr/lib64:$LD_LIBRARY_PATH
+
+# Ensure SSL and Proxy are active for this install
+export LD_LIBRARY_PATH=/usr/lib64:$LD_LIBRARY_PATH
+export http_proxy=http://proxy61.iitd.ac.in:3128
+export https_proxy=http://proxy61.iitd.ac.in:3128
+
+# Install with Trusted Host flags to bypass proxy certificate errors
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org numpy==2.2.6 pandas==2.3.3 scipy==1.15.3
+
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org tqdm scapy
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org flowcontainer scapy tqdm 
+
+
+
+
+conda setup 
+
+module load apps/anaconda/3
+# This creates a fresh environment with Python 3.10 and OpenSSL included
+conda create --prefix /scratch/cse/phd/csz258233/col7560_work/conda_env python=3.10 openssl -y
+# Activate the new environment
+conda activate /scratch/cse/phd/csz258233/col7560_work/conda_env
+
+source activate /scratch/cse/phd/csz258233/conda_env
+
+
+# Set the IITD Proxies (ensure '61' is correct for PhD)
+export http_proxy=http://proxy61.iitd.ac.in:3128
+export https_proxy=http://proxy61.iitd.ac.in:3128
+
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    scapy tqdm flowcontainer pandas numpy
+    
+ # 1. Double check proxy is still there
+export http_proxy=http://proxy61.iitd.ac.in:3128
+export https_proxy=http://proxy61.iitd.ac.in:3128
+
+# 2. Run the clean install
+/scratch/cse/phd/csz258233/conda_env/bin/python3 -m pip install --isolated --trusted-host pypi.org --trusted-host files.pythonhosted.org scapy tqdm flowcontainer pandas
+
+
+
+
+# job creation
+
+nano data_process/dataset_generation.py
+
+
+nano run_pcap.sh
+
+qsub run_pcap.sh
+
+qstat -u csz258233
+
+nano PcapBERT_Process.e847390
+
+
+rm /scratch/cse/phd/csz258233/PcapBERT_Final_Fix.o*
+rm /scratch/cse/phd/csz258233/PcapBERT_Final_Fix.e*
+
+
+
+
+nano 
+
+
+
+
+# starting the etbert 
+
+cd /scratch/cse/phd/csz258233/col7560/et-bert
+source /scratch/cse/phd/csz258233/py39_env/lib/python3.9/venv/scripts/common/activate
+
+ls -lh /scratch/cse/phd/csz258233/col7560/et-bert/dataset/splitcap/all_packets_first_100/
+du -sh /scratch/cse/phd/csz258233/col7560/et-bert/dataset/splitcap/all_packets_first_100/
+
+
+
+    
+
