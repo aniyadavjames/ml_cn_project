@@ -80,21 +80,29 @@ def bigram_generation(packet_datagram, packet_len=64):
 # --- 3. PROCESSING FUNCTIONS ---
 
 def split_cap_logic(full_path, pcap_name):
-    """Handles the splitting phase with a duplicate check"""
     output_path = os.path.join(OUTPUT_BASE, pcap_name)
+    done_flag = os.path.join(output_path, ".split_done") # The "Success" marker
+    
     os.makedirs(output_path, exist_ok=True)
     
-    # Check if files already exist to skip re-splitting (saves hours on HPC)
-    if any("session" in f for f in os.listdir(output_path)):
-        print(f"DEBUG: {pcap_name} already split. Skipping to extraction.")
+    # Only skip if the flag file exists
+    if os.path.exists(done_flag):
+        print(f"DEBUG: {pcap_name} already fully split. Skipping.")
         return output_path
 
+    # If we are here, either it's the first time or the last attempt failed
+    # Clean the directory to avoid mixing old and new session files
+    for f in os.listdir(output_path):
+        os.remove(os.path.join(output_path, f))
+
     cmd = SPLIT_COMMAND_TEMPLATE.format(input=full_path, output=output_path)
-    print(f"🛠️  Splitting: {os.path.basename(full_path)}")
+    print(f"Splitting: {pcap_name}...")
     exit_code = os.system(cmd)
     
-    if exit_code != 0:
-        print(f"ERROR: Split command failed for {pcap_name}")
+    if exit_code == 0:
+        with open(done_flag, 'w') as f: f.write('done')
+    else:
+        print(f"ERROR: Split failed for {pcap_name}")
     return output_path
 
 def get_burst_feature_worker(args):
@@ -104,6 +112,7 @@ def get_burst_feature_worker(args):
     from flowcontainer.extractor import extract
     
     label_pcap, payload_len = args
+    print(f"Processing: {os.path.basename(label_pcap)}")
     burst_txt = ""
     
     if not os.path.exists(label_pcap) or os.path.getsize(label_pcap) < 100:
