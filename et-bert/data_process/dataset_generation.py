@@ -1,216 +1,174 @@
-#!/usr/bin/python3
-#-*- coding:utf-8 -*-
+import os, sys, time, struct, mmap, resource, binascii, hashlib
+import multiprocessing as mp
 
-import os
-import sys
-import shutil
-import binascii
-import random
-import json
-import resource
-from multiprocessing import Pool, cpu_count
-
-# --- 1. HYBRID CONFIGURATION SWITCH ---
-# This detects if we are on the IITD cluster or your laptop/PC
+# --- 1. HYBRID CONFIGURATION (Fixed to match your local script) ---
 IS_HPC = os.path.exists("/scratch/cse/phd/csz258233")
 
 if IS_HPC:
     # HPC PATHS
     env_site_packages = "/scratch/cse/phd/csz258233/py39_env/lib/python3.9/site-packages"
     PROJECT_ROOT = "/scratch/cse/phd/csz258233/col7560/et-bert"
-    SOURCE_PCAP_DIR = "/scratch/cse/phd/csz258233/col7560/et-bert/pcaps"
-    # HPC usually lacks mono; tcpdump is the reliable heavy-lifter
-    SPLIT_COMMAND_TEMPLATE = "tcpdump -r {input} -w {output}/session -C 100"
+    SOURCE_PCAP_DIR = os.path.join(PROJECT_ROOT, "pcaps")
+    NUM_WRITERS = 28 # Your HPC Task count
 else:
-    # LOCAL PATHS
+    # LOCAL PATHS (Exactly like your local script)
     env_site_packages = None 
     PROJECT_ROOT = os.getcwd() 
     SOURCE_PCAP_DIR = os.path.join(PROJECT_ROOT, "pcap")
-    # Using 10MB chunks for local testing to see results faster
-    SPLIT_COMMAND_TEMPLATE = "tcpdump -r {input} -w {output}/session -C 10" 
+    NUM_WRITERS = 4
 
 # Add custom environment to path if on HPC
 if IS_HPC and env_site_packages and env_site_packages not in sys.path:
     sys.path.insert(0, env_site_packages)
 
-# Global Constants
-OUTPUT_BASE = os.path.join(PROJECT_ROOT, "dataset/splitcap")
 CORPUS_DIR = os.path.join(PROJECT_ROOT, "corpora")
+SHARD_DIR = os.path.join(CORPUS_DIR, "shards")
 WORD_NAME = "encrypted_burst.txt"
 
-random.seed(40)
+# Ring Buffer Config (Your friend's logic)
+RING_SIZE = 256 * 1024 * 1024
+HEADER_SIZE, WRITE_POS_OFF, READ_POS_OFF, DONE_OFF = 64, 0, 8, 16
+_rec, _u64, _u32 = struct.Struct("<IIII"), struct.Struct("<Q"), struct.Struct("<I")
 
-# --- 2. SYSTEM UTILITIES ---
+# --- 2. YOUR EXTRACTION LOGIC ---
 
-def maximize_file_limits():
-    """Optimizes system for high-concurrency file reading"""
+def bigram_generation(packet_hex, packet_len=64):
+    """Your Bigram logic: 'a1 b2 c3 '"""
+    # Using your 'cut' logic logic implicitly here for speed
+    truncated = packet_hex[:2*packet_len]
+    return " ".join([truncated[i:i+2] for i in range(0, len(truncated)-1, 2)])
+
+def extract_packet_info(ts, raw):
+    """Zero-copy header slice for session ID"""
+    try:
+        # Standard IPv4 offsets
+        src_ip = ".".join(map(str, raw[26:30]))
+        dst_ip = ".".join(map(str, raw[30:34]))
+        ips = sorted([src_ip, dst_ip])
+        key = f"{ips[0]}_{ips[1]}" 
+        direction = 1 if src_ip == ips[0] else -1
+        return key, (ts, direction, binascii.hexlify(raw).decode())
+    except:
+        return None, None
+
+# --- 3. SHARED MEMORY RING BUFFER UTILS ---
+
+def _ring_write(mm, frame):
+    flen = len(frame)
+    while True:
+        wp, rp = _u64.unpack_from(mm, WRITE_POS_OFF)[0], _u64.unpack_from(mm, READ_POS_OFF)[0]
+        if (RING_SIZE - ((wp - rp) % RING_SIZE) - 1) >= (4 + flen): break
+        time.sleep(0.00005)
+    off = HEADER_SIZE + (wp % RING_SIZE)
+    _u32.pack_into(mm, off, flen)
+    wp_new = wp + 4
+    mm[HEADER_SIZE + (wp_new % RING_SIZE):HEADER_SIZE + (wp_new % RING_SIZE) + flen] = frame
+    _u64.pack_into(mm, WRITE_POS_OFF, wp_new + flen)
+
+def _ring_read_all(mm):
+    while True:
+        wp, rp = _u64.unpack_from(mm, WRITE_POS_OFF)[0], _u64.unpack_from(mm, READ_POS_OFF)[0]
+        if wp == rp:
+            if _u64.unpack_from(mm, DONE_OFF)[0]: return
+            time.sleep(0.00005); continue
+        off = HEADER_SIZE + (rp % RING_SIZE)
+        flen = _u32.unpack_from(mm, off)[0]
+        rp_new = rp + 4
+        frame = mm[HEADER_SIZE + (rp_new % RING_SIZE):HEADER_SIZE + (rp_new % RING_SIZE) + flen]
+        _u64.pack_into(mm, READ_POS_OFF, rp_new + flen)
+        yield frame
+
+# --- 4. THE WRITER (Contiguous Session Aggregator) ---
+
+def writer_worker(worker_id, mm):
+    os.makedirs(SHARD_DIR, exist_ok=True)
+    shard_path = os.path.join(SHARD_DIR, f"shard_{worker_id}.txt")
+    
+    # Store all packets for a session in a dict: key -> [(ts, dir, hex), ...]
+    session_packets = {} 
+
+    print(f"[Writer {worker_id}] Collecting sessions...")
+    for frame in _ring_read_all(mm):
+        nul = frame.index(b'\x00')
+        key = frame[:nul].decode()
+        data = eval(frame[nul+1:].decode()) # (ts, dir, hex)
+        
+        if key not in session_packets:
+            session_packets[key] = []
+        session_packets[key].append(data)
+
+    print(f"[Writer {worker_id}] Writing contiguous blocks to {shard_path}")
+    with open(shard_path, "w") as f:
+        for sid in session_packets:
+            # Sort packets within this session by time
+            packets = sorted(session_packets[sid], key=lambda x: x[0])
+            
+            # Extract bursts for this specific session
+            current_burst_hex = ""
+            last_dir = packets[0][1]
+            for ts, dr, hex_val in packets:
+                if dr != last_dir:
+                    f.write(bigram_generation(current_burst_hex) + "\n")
+                    current_burst_hex = hex_val
+                    last_dir = dr
+                else:
+                    current_burst_hex += hex_val
+            
+            # Final burst and session separator
+            f.write(bigram_generation(current_burst_hex) + "\n\n")
+            session_packets[sid] = None # Help Garbage Collector
+
+# --- 5. MAIN ---
+
+def reader_logic(mmaps, done_event):
+    # Find the PCAP in your local/HPC directory
+    pcap_files = [f for f in os.listdir(SOURCE_PCAP_DIR) if f.lower().endswith(('.pcap', '.pcapng'))]
+    if not pcap_files:
+        print("CRITICAL: No PCAP found in", SOURCE_PCAP_DIR)
+        done_event.set(); return
+    
+    target_pcap = os.path.join(SOURCE_PCAP_DIR, pcap_files[0])
+    print(f"[Reader] Processing: {target_pcap}")
+
+    with open(target_pcap, "rb") as f:
+        f.seek(24) # Skip PCAP global header
+        while True:
+            hdr = f.read(16)
+            if len(hdr) < 16: break
+            ts_s, ts_us, cap_len, _ = _rec.unpack(hdr)
+            raw = f.read(cap_len)
+            key, data = extract_packet_info(ts_s + ts_us*1e-6, raw)
+            if key:
+                frame = key.encode() + b'\x00' + str(data).encode()
+                # Hash routing ensures session packets stay together in one ring
+                _ring_write(mmaps[hash(key) % len(mmaps)], frame)
+    
+    done_event.set()
+
+if __name__ == "__main__":
+    # Maximize limits
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        # Set soft to hard to handle thousands of session files on HPC
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-        new_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if IS_HPC: print(f"DEBUG: File limits maximized to {new_soft}")
-    except Exception as e:
-        print(f"Note: Limit maximization skipped ({e})")
+    except: pass
 
-def cut(obj, sec):
-    if not obj: return []
-    result = [obj[i:i+sec] for i in range(0, len(obj), sec)]
-    try:
-        remanent_count = len(result[0]) % 4
-    except:
-        remanent_count = 0
-    if remanent_count != 0:
-        result = [obj[i:i+sec+remanent_count] for i in range(0, len(obj), sec+remanent_count)]
-    return result
-
-def bigram_generation(packet_datagram, packet_len=64):
-    result = ''
-    generated_datagram = cut(packet_datagram, 1)
-    token_count = 0
-    for i in range(len(generated_datagram)):
-        if i != (len(generated_datagram) - 1):
-            token_count += 1
-            if token_count > packet_len: break
-            merge_word = generated_datagram[i] + generated_datagram[i + 1]
-            result += merge_word + ' '
-        else: break
-    return result
-
-# --- 3. PROCESSING FUNCTIONS ---
-
-def split_cap_logic(full_path, pcap_name):
-    output_path = os.path.join(OUTPUT_BASE, pcap_name)
-    done_flag = os.path.join(output_path, ".split_done") # The "Success" marker
+    mmaps = [mmap.mmap(-1, HEADER_SIZE + RING_SIZE) for _ in range(NUM_WRITERS)]
+    for mm in mmaps: mm[:HEADER_SIZE] = b'\x00' * HEADER_SIZE
     
-    os.makedirs(output_path, exist_ok=True)
+    done_ev = mp.Event()
     
-    # Only skip if the flag file exists
-    if os.path.exists(done_flag):
-        print(f"DEBUG: {pcap_name} already fully split. Skipping.")
-        return output_path
-
-    # If we are here, either it's the first time or the last attempt failed
-    # Clean the directory to avoid mixing old and new session files
-    for f in os.listdir(output_path):
-        os.remove(os.path.join(output_path, f))
-
-    cmd = SPLIT_COMMAND_TEMPLATE.format(input=full_path, output=output_path)
-    print(f"Splitting: {pcap_name}...")
-    exit_code = os.system(cmd)
+    # Launch Workers
+    writers = [mp.Process(target=writer_worker, args=(i, mmaps[i])) for i in range(NUM_WRITERS)]
+    for p in writers: p.start()
     
-    if exit_code == 0:
-        with open(done_flag, 'w') as f: f.write('done')
-    else:
-        print(f"ERROR: Split failed for {pcap_name}")
-    return output_path
-
-def get_burst_feature_worker(args):
-    """Worker function for parallel core usage"""
-    # Import inside worker to ensure each process has proper context
-    import scapy.all as scapy
-    from flowcontainer.extractor import extract
+    # Launch Reader
+    reader_proc = mp.Process(target=reader_logic, args=(mmaps, done_ev))
+    reader_proc.start()
     
-    label_pcap, payload_len = args
-    print(f"Processing: {os.path.basename(label_pcap)}")
-    burst_txt = ""
+    reader_proc.join()
+    # Signal writers to finish
+    for mm in mmaps: _u64.pack_into(mm, DONE_OFF, 1)
+    for p in writers: p.join()
     
-    if not os.path.exists(label_pcap) or os.path.getsize(label_pcap) < 100:
-        return ""
-
-    try:
-        packets = scapy.rdpcap(label_pcap)
-        if len(packets) == 0: return ""
-        
-        try:
-            feature_result = extract(label_pcap)
-        except:
-            return ""
-
-        if not feature_result: return ""
-
-        for key in feature_result.keys():
-            value = feature_result[key]
-            if not hasattr(value, 'ip_lengths') or len(value.ip_lengths) != len(packets):
-                continue
-            
-            packet_direction = [x // abs(x) if x != 0 else 1 for x in value.ip_lengths]
-            burst_data_string = ''
-            
-            for i in range(len(packets)):
-                raw_bytes = bytes(packets[i])
-                data = binascii.hexlify(raw_bytes).decode()[:2*payload_len]
-                
-                if i == 0:
-                    burst_data_string += data
-                else:
-                    if packet_direction[i] != packet_direction[i-1]:
-                        length = len(burst_data_string)
-                        if length > 0:
-                            for s in cut(burst_data_string, max(1, int(length / 2))):
-                                burst_txt += bigram_generation(s) + '\n'
-                            burst_txt += '\n'
-                        burst_data_string = data
-                    else:
-                        burst_data_string += data
-            
-            if burst_data_string:
-                for s in cut(burst_data_string, max(1, int(len(burst_data_string) / 2))):
-                    burst_txt += bigram_generation(s) + '\n'
-                burst_txt += '\n'
-                
-        return burst_txt
-    except Exception:
-        return ""
-
-# --- 4. MAIN ORCHESTRATOR ---
-
-def pretrain_dataset_generation(pcap_path):
-    os.makedirs(OUTPUT_BASE, exist_ok=True)
-    os.makedirs(CORPUS_DIR, exist_ok=True)
-
-    print(f"--- Mode: {'HPC' if IS_HPC else 'LOCAL'} ---")
-    print(f"DEBUG: Project Root: {PROJECT_ROOT}")
-    
-    pcap_files = []
-    for _parent, _dirs, files in os.walk(pcap_path):
-        for file in files:
-            if file.lower().endswith(('.pcap', '.pcapng')):
-                pcap_files.append(os.path.join(_parent, file))
-
-    if not pcap_files:
-        print("CRITICAL: No PCAP files found. Check your SOURCE_PCAP_DIR.")
-        return
-
-    # Phase 1: Split
-    for full_path in pcap_files:
-        name = os.path.basename(full_path).replace('.pcap','').replace('.pcapng','')
-        split_cap_logic(full_path, name)
-
-    # Phase 2: Collect session chunks
-    print(f"Starting Extraction on {cpu_count()} cores...")
-    task_list = []
-    for root, _, files in os.walk(OUTPUT_BASE):
-        for f in files:
-            if 'session' in f:
-                task_list.append((os.path.join(root, f), 64))
-
-    # Phase 3: Parallel Process
-    if task_list:
-        with Pool(processes=cpu_count()) as pool:
-            # imap_unordered is memory efficient for large datasets
-            results = pool.imap_unordered(get_burst_feature_worker, task_list)
-            
-            output_file = os.path.join(CORPUS_DIR, WORD_NAME)
-            # Use 'a' to append so we don't wipe data on job restarts
-            with open(output_file, 'a') as f:
-                for res in results:
-                    if res: f.write(res)
-    else:
-        print("DEBUG: Task list empty. Nothing to extract.")
-
-    print(f"Finished! Output: {os.path.join(CORPUS_DIR, WORD_NAME)}")
-
-if __name__ == '__main__':
-    maximize_file_limits()
-    pretrain_dataset_generation(SOURCE_PCAP_DIR)
+    print(f"Extraction complete. Shards in {SHARD_DIR}")
+    print(f"Final Merge: cat {SHARD_DIR}/shard_*.txt > {CORPUS_DIR}/{WORD_NAME}")
