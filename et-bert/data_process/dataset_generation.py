@@ -45,16 +45,40 @@ def extract_packet_info(ts, raw):
 
 def _ring_write(mm, frame):
     flen = len(frame)
-    while True:
-        wp, rp = _u64.unpack_from(mm, WRITE_POS_OFF)[0], _u64.unpack_from(mm, READ_POS_OFF)[0]
-        if (RING_SIZE - ((wp - rp) % RING_SIZE) - 1) >= (4 + flen): break
-        time.sleep(0.00005)
-    off = HEADER_SIZE + (wp % RING_SIZE)
-    _u32.pack_into(mm, off, flen)
-    wp_new = wp + 4
-    mm[HEADER_SIZE + (wp_new % RING_SIZE):HEADER_SIZE + (wp_new % RING_SIZE) + flen] = frame
-    _u64.pack_into(mm, WRITE_POS_OFF, wp_new + flen)
+    total_need = 4 + flen
 
+    while True:
+        wp = _u64.unpack_from(mm, WRITE_POS_OFF)[0]
+        rp = _u64.unpack_from(mm, READ_POS_OFF)[0]
+        free = RING_SIZE - ((wp - rp) % RING_SIZE) - 1
+        if free >= total_need: break
+        time.sleep(0.00005)
+
+    # 1. Write the 4-byte length header (handles wrap-around)
+    off = HEADER_SIZE + (wp % RING_SIZE)
+    if (wp % RING_SIZE) + 4 <= RING_SIZE:
+        _u32.pack_into(mm, off, flen)
+    else:
+        # Header itself is split (rare but possible)
+        header_bytes = _u32.pack(flen)
+        for i in range(4):
+            mm[HEADER_SIZE + ((wp + i) % RING_SIZE)] = header_bytes[i]
+    
+    wp_new = wp + 4
+
+    # 2. Write the frame bytes (The "Slice" Fix)
+    curr_off = wp_new % RING_SIZE
+    if curr_off + flen <= RING_SIZE:
+        # Fits in one piece
+        mm[HEADER_SIZE + curr_off : HEADER_SIZE + curr_off + flen] = frame
+    else:
+        # MUST SPLIT: Write part to end, part to beginning
+        end_chunk_size = RING_SIZE - curr_off
+        mm[HEADER_SIZE + curr_off : HEADER_SIZE + RING_SIZE] = frame[:end_chunk_size]
+        mm[HEADER_SIZE : HEADER_SIZE + (flen - end_chunk_size)] = frame[end_chunk_size:]
+
+    _u64.pack_into(mm, WRITE_POS_OFF, wp_new + flen)
+    
 def _ring_read_all(mm):
     while True:
         wp, rp = _u64.unpack_from(mm, WRITE_POS_OFF)[0], _u64.unpack_from(mm, READ_POS_OFF)[0]
