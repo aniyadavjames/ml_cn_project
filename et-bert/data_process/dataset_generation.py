@@ -1,4 +1,4 @@
-import os, sys, time, struct, mmap, resource, binascii, hashlib, ast
+import os, sys, time, struct, mmap, resource, binascii, hashlib
 import multiprocessing as mp
 
 # --- 1. HYBRID CONFIGURATION ---
@@ -7,7 +7,7 @@ IS_HPC = os.path.exists("/scratch/cse/phd/csz258233")
 if IS_HPC:
     PROJECT_ROOT = "/scratch/cse/phd/csz258233/col7560/et-bert"
     SOURCE_PCAP_DIR = os.path.join(PROJECT_ROOT, "pcaps")
-    NUM_WRITERS = 28 
+    NUM_WRITERS = 28 # Matched to TSK on HPC
 else:
     PROJECT_ROOT = os.getcwd() 
     SOURCE_PCAP_DIR = os.path.join(PROJECT_ROOT, "pcap")
@@ -26,82 +26,76 @@ IDLE_TIMEOUT = 60.0
 # --- 2. EXTRACTION LOGIC ---
 
 def bigram_generation(packet_hex, packet_len=64):
+    """Generates ET-BERT bigrams: 'a1 b2 c3'"""
     truncated = packet_hex[:2*packet_len]
     return " ".join([truncated[i:i+2] for i in range(0, len(truncated)-1, 2)])
 
 def extract_packet_info(ts, raw):
+    """Fast header slice for session ID"""
     try:
-        # Fast slice for IPv4 (Standard Ethernet)
+        # Standard IPv4 offset (Eth=14, IPs at 26-34)
         src_ip = ".".join(map(str, raw[26:30]))
         dst_ip = ".".join(map(str, raw[30:34]))
         ips = sorted([src_ip, dst_ip])
         key = f"{ips[0]}_{ips[1]}" 
         direction = 1 if src_ip == ips[0] else -1
-        return key, (ts, direction, binascii.hexlify(raw).decode())
+        return key, ts, direction, binascii.hexlify(raw).decode()
     except:
-        return None, None
+        return None
 
-# --- 3. RING BUFFER UTILS ---
+# --- 3. SYMMETRIC RING BUFFER UTILS ---
 
 def _ring_write(mm, frame):
+    """Writes frame byte-by-byte to ensure wrap-around never crashes"""
     flen = len(frame)
     total_need = 4 + flen
-
     while True:
         wp = _u64.unpack_from(mm, WRITE_POS_OFF)[0]
         rp = _u64.unpack_from(mm, READ_POS_OFF)[0]
-        free = RING_SIZE - ((wp - rp) % RING_SIZE) - 1
-        if free >= total_need: break
-        time.sleep(0.00005)
+        if (RING_SIZE - ((wp - rp) % RING_SIZE) - 1) >= total_need: break
+        time.sleep(0.0001)
 
-    # 1. Write the 4-byte length header (handles wrap-around)
-    off = HEADER_SIZE + (wp % RING_SIZE)
-    if (wp % RING_SIZE) + 4 <= RING_SIZE:
-        _u32.pack_into(mm, off, flen)
-    else:
-        # Header itself is split (rare but possible)
-        header_bytes = _u32.pack(flen)
-        for i in range(4):
-            mm[HEADER_SIZE + ((wp + i) % RING_SIZE)] = header_bytes[i]
+    # Write 4-byte length byte-by-byte
+    header_bytes = _u32.pack(flen)
+    for i in range(4):
+        mm[HEADER_SIZE + ((wp + i) % RING_SIZE)] = header_bytes[i]
     
-    wp_new = wp + 4
+    # Write Data byte-by-byte
+    wp_data = wp + 4
+    for i in range(flen):
+        mm[HEADER_SIZE + ((wp_data + i) % RING_SIZE)] = frame[i]
 
-    # 2. Write the frame bytes (The "Slice" Fix)
-    curr_off = wp_new % RING_SIZE
-    if curr_off + flen <= RING_SIZE:
-        # Fits in one piece
-        mm[HEADER_SIZE + curr_off : HEADER_SIZE + curr_off + flen] = frame
-    else:
-        # MUST SPLIT: Write part to end, part to beginning
-        end_chunk_size = RING_SIZE - curr_off
-        mm[HEADER_SIZE + curr_off : HEADER_SIZE + RING_SIZE] = frame[:end_chunk_size]
-        mm[HEADER_SIZE : HEADER_SIZE + (flen - end_chunk_size)] = frame[end_chunk_size:]
+    _u64.pack_into(mm, WRITE_POS_OFF, wp_data + flen)
 
-    _u64.pack_into(mm, WRITE_POS_OFF, wp_new + flen)
-    
 def _ring_read_all(mm):
+    """Reads frame byte-by-byte to stay in sync with Reader"""
     while True:
-        wp, rp = _u64.unpack_from(mm, WRITE_POS_OFF)[0], _u64.unpack_from(mm, READ_POS_OFF)[0]
+        wp = _u64.unpack_from(mm, WRITE_POS_OFF)[0]
+        rp = _u64.unpack_from(mm, READ_POS_OFF)[0]
         if wp == rp:
             if _u64.unpack_from(mm, DONE_OFF)[0]: return
             time.sleep(0.0001); continue
-        off = HEADER_SIZE + (rp % RING_SIZE)
-        flen = _u32.unpack_from(mm, off)[0]
-        rp_new = rp + 4
-        # Handle wrap-around frame extraction
+
+        # Read 4-byte length byte-by-byte
+        l_bytes = bytearray(4)
+        for i in range(4):
+            l_bytes[i] = mm[HEADER_SIZE + ((rp + i) % RING_SIZE)]
+        flen = _u32.unpack(l_bytes)[0]
+        
+        # Read Data byte-by-byte
+        rp_data = rp + 4
         frame = bytearray(flen)
         for i in range(flen):
-            frame[i] = mm[HEADER_SIZE + ((rp_new + i) % RING_SIZE)]
-        _u64.pack_into(mm, READ_POS_OFF, rp_new + flen)
+            frame[i] = mm[HEADER_SIZE + ((rp_data + i) % RING_SIZE)]
+            
+        _u64.pack_into(mm, READ_POS_OFF, rp_data + flen)
         yield bytes(frame)
 
-# --- 4. THE WRITER (With Flush Logic) ---
+# --- 4. THE WRITER (Saves Session Groups) ---
 
 def writer_worker(worker_id, mm):
     os.makedirs(SHARD_DIR, exist_ok=True)
     shard_path = os.path.join(SHARD_DIR, f"shard_{worker_id}.txt")
-    
-    # key -> list of packets
     session_packets = {} 
     pkt_count = 0
 
@@ -109,47 +103,48 @@ def writer_worker(worker_id, mm):
         print(f"[Writer {worker_id}] Processing...")
         for frame in _ring_read_all(mm):
             try:
-                nul = frame.index(b'\x00')
-                key = frame[:nul].decode(errors='ignore')
-                data = ast.literal_eval(frame[nul+1:].decode(errors='ignore'))
+                # Format: key|ts|dir|hex
+                parts = frame.decode(errors='ignore').split('|')
+                if len(parts) < 4: continue
+                
+                key, ts, dr, hx = parts[0], float(parts[1]), int(parts[2]), parts[3]
                 
                 if key not in session_packets:
                     session_packets[key] = []
-                session_packets[key].append(data)
+                session_packets[key].append((ts, dr, hx))
                 pkt_count += 1
 
-                # --- AUTO-FLUSH TO PROTECT RAM (Every 1M packets) ---
-                if pkt_count % 1000000 == 0:
-                    current_ts = data[0]
-                    expired = [sid for sid, pks in session_packets.items() if (current_ts - pks[-1][0]) > IDLE_TIMEOUT]
+                # Flush inactive sessions every 500k packets to keep RAM clean
+                if pkt_count % 500000 == 0:
+                    curr_ts = ts
+                    expired = [sid for sid, pks in session_packets.items() if (curr_ts - pks[-1][0]) > IDLE_TIMEOUT]
                     for sid in expired:
                         write_session_to_file(f_out, session_packets[sid])
                         del session_packets[sid]
             except: continue
 
-        # Final Flush at end of file
+        # Final flush
         for sid in session_packets:
             write_session_to_file(f_out, session_packets[sid])
     
     print(f"[Writer {worker_id}] Completed.")
 
 def write_session_to_file(f_handle, packets):
-    """Sorts and writes a single session block"""
     if not packets: return
-    packets.sort(key=lambda x: x[0])
+    packets.sort(key=lambda x: x[0]) # GROUPED and ORDERED
     
-    current_burst_hex = ""
+    curr_burst = ""
     last_dir = packets[0][1]
     
-    for ts, dr, hex_val in packets:
+    for _, dr, hex_val in packets:
         if dr != last_dir:
-            f_handle.write(bigram_generation(current_burst_hex) + "\n")
-            current_burst_hex = hex_val
+            f_handle.write(bigram_generation(curr_burst) + "\n")
+            curr_burst = hex_val
             last_dir = dr
         else:
-            current_burst_hex += hex_val
+            curr_burst += hex_val
     
-    f_handle.write(bigram_generation(current_burst_hex) + "\n\n")
+    f_handle.write(bigram_generation(curr_burst) + "\n\n")
 
 # --- 5. MAIN ---
 
@@ -167,10 +162,12 @@ def reader_logic(mmaps, done_event):
             if len(hdr) < 16: break
             ts_s, ts_us, cap_len, _ = _rec.unpack(hdr)
             raw = f.read(cap_len)
-            key, data = extract_packet_info(ts_s + ts_us*1e-6, raw)
-            if key:
-                frame = key.encode() + b'\x00' + str(data).encode()
-                _ring_write(mmaps[hash(key) % len(mmaps)], frame)
+            res = extract_packet_info(ts_s + ts_us*1e-6, raw)
+            if res:
+                key, ts, dr, hx = res
+                # Pipe-delimited string is 10x faster than eval()
+                frame_str = f"{key}|{ts}|{dr}|{hx}"
+                _ring_write(mmaps[hash(key) % len(mmaps)], frame_str.encode())
     done_event.set()
 
 if __name__ == "__main__":
@@ -192,4 +189,4 @@ if __name__ == "__main__":
     reader_proc.join()
     for mm in mmaps: _u64.pack_into(mm, DONE_OFF, 1)
     for p in writers: p.join()
-    print("FINISHED. Check shards directory.")
+    print("FINISHED.")
