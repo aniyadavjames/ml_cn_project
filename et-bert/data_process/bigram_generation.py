@@ -86,4 +86,8 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
 
+<<<<<<< HEAD
     print("Processing complete. Ready to merge.")
+=======
+    print("Processing complete. Ready to merge.")
+>>>>>>> 1ae286efdce9d7b138f185dfdc6f84bde9d216d3
