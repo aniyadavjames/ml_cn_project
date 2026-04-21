@@ -103,6 +103,7 @@ nano run_pcap.sh
 qsub run_pcap.sh
 
 qstat -u csz258233
+qdel -W force 870404.pbshpc 
 
 nano PcapBERT_Process.e847390
 
@@ -111,9 +112,25 @@ rm /scratch/cse/phd/csz258233/PcapBERT_Final_Fix.o*
 rm /scratch/cse/phd/csz258233/PcapBERT_Final_Fix.e*
 
 
+rm /scratch/cse/phd/csz258233/ETBERT_Pretrain.o*
+rm /scratch/cse/phd/csz258233/ETBERT_Pretrain.e*
 
 
-nano 
+
+# sendind data from mayank to me 
+
+	# 1. Create the destination folder
+	mkdir -p /scratch/cse/phd/csz258233/col7560/et-bert/csz258231
+
+	# 2. Give your friend 'execute' permission on your scratch root so they can reach the folder
+	setfacl -m u:csz258231:x /scratch/cse/phd/csz258233
+
+	# 3. Give your friend full 'rwx' (read/write/execute) permission on the specific folder
+	setfacl -R -m u:csz258231:rwx /scratch/cse/phd/csz258233/col7560/et-bert/csz258231
+	
+	
+
+
 
 
 
@@ -125,6 +142,14 @@ source /scratch/cse/phd/csz258233/py39_env/lib/python3.9/venv/scripts/common/act
 
 ls -lh /scratch/cse/phd/csz258233/col7560/et-bert/dataset/splitcap/all_packets_first_100/
 du -sh /scratch/cse/phd/csz258233/col7560/et-bert/dataset/splitcap/all_packets_first_100/
+
+#looking the file 
+head -n 10 /scratch/cse/phd/csz258233/col7560/et-bert/corpora/encrypted_burst.txt
+
+du -sh  col7560/et-bert/corpora/shards/
+csz258231
+
+cd /scratch/cse/phd/csz258231/flows_split/final_flow
 
 
 

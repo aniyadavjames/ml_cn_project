@@ -9,7 +9,7 @@ if IS_HPC:
     SOURCE_PCAP_DIR = os.path.join(PROJECT_ROOT, "pcaps")
     NUM_WRITERS = 28 # Matched to TSK on HPC
 else:
-    PROJECT_ROOT = os.getcwd() 
+    PROJECT_ROOT = os.getcwd()
     SOURCE_PCAP_DIR = os.path.join(PROJECT_ROOT, "pcap")
     NUM_WRITERS = 4
 
@@ -26,9 +26,16 @@ IDLE_TIMEOUT = 60.0
 # --- 2. EXTRACTION LOGIC ---
 
 def bigram_generation(packet_hex, packet_len=64):
-    """Generates ET-BERT bigrams: 'a1 b2 c3'"""
-    truncated = packet_hex[:2*packet_len]
-    return " ".join([truncated[i:i+2] for i in range(0, len(truncated)-1, 2)])
+    """Generates ET-BERT bigrams (sliding window of 2 bytes)"""
+    res = []
+    # Step by 2 (byte alignment), take 4 (sliding window)
+    for i in range(0, len(packet_hex) - 2, 2):
+        token = packet_hex[i:i+4]
+        if len(token) == 4:
+            res.append(token)
+        if len(res) >= packet_len:
+            break
+    return " ".join(res)
 
 def extract_packet_info(ts, raw):
     """Fast header slice for session ID"""
