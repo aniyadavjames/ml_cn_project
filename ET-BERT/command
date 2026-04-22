@@ -1,0 +1,286 @@
+
+on local
+
+
+#Step 1:creating small pcaps 
+
+python3 data_process/main.py --pcap_dir ../datasets/college_data/ --splitcap True
+Success Check: Look inside ../datasets/college_data/splitcap/0/ to ensure it is filled with tiny session .pcap files.
+
+#Step 2: lebeled data set
+python3 data_process/main.py --pcap_dir ../datasets/college_data/splitcap/
+Success Check:  You should now see train_dataset.tsv, valid_dataset.tsv, and test_dataset.tsv generated in your college_data/ folder.
+
+#Step 3: Generate the Pre-training Corpus (TXT)
+python3 data_process/main.py --pcap_dir ../datasets/college_data/splitcap/
+
+
+
+2. Pre-training Stage 
+
+	If you are training ET-BERT from scratch rather than using the downloaded pre-trained model, use these commands:
+
+
+		# Step 1: Generate the pre-training text corpus (encrypted_burst.txt)
+		python3 data_process/dataset_generation.py --pcap_dir ../datasets/campus_source/splitcap/ --pretrain
+
+		# Step 2: Pre-process the text corpus into a PyTorch dataset format (.pt)
+		python3 preprocess.py \
+		    --corpus_path corpora/encrypted_burst.txt \
+		    --vocab_path models/encryptd_vocab.txt \
+		    --dataset_path dataset.pt \
+		    --processes_num 20 \
+		    --target bert
+
+		# Step 3: Run the pre-training on the dataset
+		python3 pre-training/pretrain.py \
+		    --dataset_path dataset.pt \
+		    --vocab_path models/encryptd_vocab.txt \
+		    --output_model_path models/pre-trained_model.bin \
+		    --world_size 8 --gpu_ranks 0 1 2 3 4 5 6 7 \
+		    --total_steps 500000 --save_checkpoint_steps 10000 --batch_size 32 \
+		    --embedding word_pos_seg --encoder transformer --mask fully_visible --target bert
+		    
+		    
+		    python3 pre-training/pretrain.py \
+			    --dataset_path dataset.pt \
+			    --vocab_path models/encryptd_vocab.txt \
+			    --output_model_path models/colege_data_pre-trained_model.bin \
+			    --world_size 1 \
+			    --gpu_ranks 0 \
+			    --total_steps 500000 \
+			    --save_checkpoint_steps 10000 \
+			    --batch_size 32 \
+			    --embedding word_pos_seg \
+			    --encoder transformer \
+			    --mask fully_visible \
+			    --target bert
+			    
+		#for local 
+		
+		    
+		    
+		    
+		    OMP_NUM_THREADS=24 python3 pre-training/pretrain.py \
+			    --dataset_path dataset.pt \
+			    --vocab_path models/encryptd_vocab.txt \
+			    --pretrained_model_path models/pre-trained_model.bin \
+			    --output_model_path models/my_campus_pretrained.bin \
+			    --total_steps 50 \
+			    --save_checkpoint_steps 50\
+			    --batch_size 32 \
+			    --embedding word_pos_seg \
+			    --encoder transformer \
+			    --mask fully_visible \
+			    --target bert
+
+		OMP_NUM_THREADS=8 python3 pre-training/pretrain.py \
+		    --dataset_path dataset.pt \
+		    --vocab_path models/encryptd_vocab.txt \
+		    --output_model_path models/campus_pre-trained_model.bin \
+		    --total_steps 10 \
+		    --save_checkpoint_steps 10 \
+		    --batch_size 4 \
+		    --accumulation_steps 8 \
+		    --instances_buffer_size 2560 \
+		    --embedding word_pos_seg \
+		    --encoder transformer \
+		    --mask fully_visible \
+		    --target bert
+
+
+
+
+
+		# fo rhpc
+		
+			python3 pre-training/pretrain.py \
+			    --dataset_path dataset.pt \
+			    --vocab_path models/encryptd_vocab.txt \
+			    --pretrained_model_path models/pre-trained_model.bin \
+			    --output_model_path models/pre-trained_model.bin \
+			    --world_size 1 \
+			    --gpu_ranks 0 \
+			    --total_steps 500000 \
+			    --save_checkpoint_steps 10000 \
+			    --batch_size 32 \
+			    --embedding word_pos_seg \
+			    --encoder transformer \
+			    --mask fully_visible \
+			    --target bert
+
+
+
+
+
+		
+		(Note: Adjust --world_size and --gpu_ranks in the pre-training command depending on how many GPUs you actually have).
+
+
+
+3. Fine-Tuning Stage
+Once your .tsv datasets are generated from the data processing step, and you have your pre-trained_model.bin, you can run the classifier to fine-tune the model:
+
+
+
+		# Fine-tune the ET-BERT classifier
+		python3 fine-tuning/run_classifier.py \
+		    --pretrained_model_path models/pre-trained_model.bin \
+		    --vocab_path models/encryptd_vocab.txt \
+		    --train_path ../datasets/campus_source/dataset/train_dataset.tsv \
+		    --dev_path ../datasets/campus_source/dataset/valid_dataset.tsv \
+		    --test_path ../datasets/campus_source/dataset/test_dataset.tsv \
+		    --epochs_num 10 \
+		    --batch_size 32 \
+		    --embedding word_pos_seg \
+		    --encoder transformer \
+		    --mask fully_visible \
+		    --seq_length 128 \
+		    --learning_rate 2e-5
+		Use code with care. Learn more
+		
+4. Inference Stage
+After fine-tuning is complete, you can use the resulting finetuned_model.bin to classify new, unlabeled traffic:
+
+		# Run inference on unlabeled dataset
+		python3 inference/run_classifier_infer.py \
+		    --load_model_path models/finetuned_model.bin \
+		    --vocab_path models/encryptd_vocab.txt \
+		    --test_path ../datasets/campus_source/dataset/nolabel_test_dataset.tsv \
+		    --prediction_path ../datasets/campus_source/dataset/prediction.tsv \
+		    --labels_num 120 \
+		    --embedding word_pos_seg \
+		    --encoder transformer \
+		    --mask fully_visible
+
+(Note: Ensure you update --labels_num to match the exact number of traffic classes in your dataset).
+
+
+
+
+# evaluation
+
+#old model
+		# Regular Datasets
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/old_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/cicids.tsv \
+	    --output_path ../embeddings/old_model/cicids_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/old_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/caida.tsv \
+	    --output_path ../embeddings/old_model/caida_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/old_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/cross.tsv \
+	    --output_path ../embeddings/old_model/cross_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/old_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/mawi.tsv \
+	    --output_path ../embeddings/old_model/mawi_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/old_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/cicapt.tsv \
+	    --output_path ../embeddings/old_model/cicapt_emb.pkl
+
+	# Synthetic Datasets
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/old_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/synth.tsv \
+	    --output_path ../embeddings/old_model/synth_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/old_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/perf.tsv \
+	    --output_path ../embeddings/old_model/perf_emb.pkl
+	    
+	    
+# new model 
+	    
+	    
+		    # Regular Datasets
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/new_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/cicids.tsv \
+	    --output_path ../embeddings/new_model/cicids_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/new_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/caida.tsv \
+	    --output_path ../embeddings/new_model/caida_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/new_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/cross.tsv \
+	    --output_path ../embeddings/new_model/cross_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/new_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/mawi.tsv \
+	    --output_path ../embeddings/new_model/mawi_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/new_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/cicapt.tsv \
+	    --output_path ../embeddings/new_model/cicapt_emb.pkl
+
+	# Synthetic Datasets
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/new_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/synth.tsv \
+	    --output_path ../embeddings/new_model/synth_emb.pkl
+
+	python generate_embeddings.py \
+	    --pretrained_model_path ../models/new_model/model.bin \
+	    --vocab_path ../vocabs/eth.vocab \
+	    --config_path ../models/bert/base_config.json \
+	    --dataset_path ../data/perf.tsv \
+	    --output_path ../embeddings/new_model/perf_emb.pkl
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

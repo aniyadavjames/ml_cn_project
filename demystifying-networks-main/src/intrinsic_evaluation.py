@@ -13,6 +13,7 @@ Implemented methods:
 - Metric alignment assessment (CKA with CIC features)
 - Causal sensitivity testing
 - Synth math (embedding arithmetic)
+- Perturbation sensitivity testing
 
 Author: Based on Demystifying Network Foundation Models (NeurIPS 2025)
 """
@@ -78,6 +79,26 @@ class DatasetInput:
             self.cic_embeddings = self.embeddings
         else:
             self.cic_embeddings = np.nan_to_num(self.cic_embeddings, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+@dataclass
+class PerturbationEvaluationInput:
+    """Input container for perturbation-based ET-BERT sensitivity evaluation."""
+
+    dataset_name: str
+    pretrained_model_path: str
+    vocab_path: str
+    config_path: str
+    dataset_path: str
+    spm_model_path: Optional[str] = None
+    tokenizer: str = "bert"
+    pooling: str = "first"
+    seq_length: int = 128
+    batch_size: int = 64
+    device: str = "auto"
+    seed: int = 7
+    max_samples: int = 1024
+    masks: Optional[Dict[str, np.ndarray]] = None
 
 
 @dataclass
@@ -370,6 +391,238 @@ def _calculate_intrinsic_dimensionality(
     # Returns (id_value, decimation_error, id_error)
     # We return (id_value, id_error) for simpler interface
     return (ids[0], ids[2])
+
+
+# ============================================================================
+# Internal Perturbation Sensitivity (from perturb_etbert.ipynb)
+# ============================================================================
+
+def _default_perturbation_masks(seq_length: int) -> Dict[str, np.ndarray]:
+    if seq_length <= 0:
+        raise ValueError("`seq_length` must be positive for perturbation evaluation.")
+
+    quarter = max(1, seq_length // 4)
+    half = max(1, seq_length // 2)
+
+    def slice_mask(start: int, end: int) -> np.ndarray:
+        mask = np.zeros(seq_length, dtype=bool)
+        mask[start:end] = True
+        return mask
+
+    return {
+        "all_tokens": np.ones(seq_length, dtype=bool),
+        "first_quarter": slice_mask(0, quarter),
+        "second_quarter": slice_mask(quarter, min(seq_length, 2 * quarter)),
+        "third_quarter": slice_mask(min(seq_length, 2 * quarter), min(seq_length, 3 * quarter)),
+        "last_quarter": slice_mask(min(seq_length, 3 * quarter), seq_length),
+        "first_half": slice_mask(0, half),
+        "second_half": slice_mask(half, seq_length),
+    }
+
+
+def _subset_dataset_for_perturbation(
+    dataset: List[Tuple[List[int], int, List[int]]],
+    max_samples: int,
+    seed: int,
+) -> List[Tuple[List[int], int, List[int]]]:
+    if max_samples <= 0 or len(dataset) <= max_samples:
+        return dataset
+
+    rng = np.random.default_rng(seed)
+    selected_indices = np.sort(rng.choice(len(dataset), size=max_samples, replace=False))
+    return [dataset[index] for index in selected_indices]
+
+
+def _encode_src_seg_tensors(
+    model,
+    src: "torch.Tensor",
+    seg: "torch.Tensor",
+    *,
+    batch_size: int,
+    device,
+    pooling: str,
+    show_progress: bool,
+) -> "torch.Tensor":
+    from generate_embeddings import batch_loader, encode_batch
+    import torch
+
+    tgt = torch.zeros(src.size(0), dtype=torch.long)
+    batches = []
+    total_batches = (src.size(0) + batch_size - 1) // batch_size
+    loader = batch_loader(batch_size, src, tgt, seg, None)
+
+    for src_batch, _, seg_batch, _ in tqdm(
+        loader,
+        desc="Perturbation",
+        total=total_batches,
+        disable=not show_progress,
+    ):
+        batches.append(
+            encode_batch(
+                model=model,
+                src_batch=src_batch,
+                seg_batch=seg_batch,
+                device=device,
+                pooling=pooling,
+            )
+        )
+
+    return torch.cat(batches, dim=0)
+
+
+def _apply_reorder_perturbation(
+    src: "torch.Tensor",
+    mask: "torch.Tensor",
+    *,
+    generator: "torch.Generator",
+) -> "torch.Tensor":
+    import torch
+
+    perturbed = src.clone()
+    masked_columns = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+    for column_index in masked_columns:
+        permutation = torch.randperm(src.size(0), generator=generator)
+        perturbed[:, column_index] = src[permutation, column_index]
+    return perturbed
+
+
+def _apply_random_perturbation(
+    src: "torch.Tensor",
+    mask: "torch.Tensor",
+    *,
+    vocab_size: int,
+    generator: "torch.Generator",
+) -> "torch.Tensor":
+    import torch
+
+    perturbed = src.clone()
+    masked_columns = torch.nonzero(mask, as_tuple=False).flatten()
+    if masked_columns.numel() == 0:
+        return perturbed
+
+    if vocab_size <= 2:
+        low, high = 0, max(vocab_size, 1)
+    elif vocab_size > 6:
+        low, high = 6, vocab_size
+    else:
+        low, high = 1, vocab_size
+
+    random_tokens = torch.randint(
+        low=low,
+        high=high,
+        size=(src.size(0), masked_columns.numel()),
+        generator=generator,
+        dtype=src.dtype,
+    )
+    perturbed[:, masked_columns] = random_tokens
+    return perturbed
+
+
+def _compute_perturbation_sensitivity(
+    perturbation_input: PerturbationEvaluationInput,
+    *,
+    show_progress: bool = True,
+) -> Dict[str, Dict[str, float]]:
+    import torch
+    import torch.nn.functional as F
+
+    from generate_embeddings import build_model, build_runtime_args, read_embedding_dataset
+
+    args = build_runtime_args(
+        pretrained_model_path=perturbation_input.pretrained_model_path,
+        vocab_path=perturbation_input.vocab_path,
+        config_path=perturbation_input.config_path,
+        dataset_path=perturbation_input.dataset_path,
+        spm_model_path=perturbation_input.spm_model_path,
+        batch_size=perturbation_input.batch_size,
+        seq_length=perturbation_input.seq_length,
+        pooling=perturbation_input.pooling,
+        tokenizer=perturbation_input.tokenizer,
+        device=perturbation_input.device,
+        seed=perturbation_input.seed,
+    )
+
+    model = build_model(args)
+    dataset, _ = read_embedding_dataset(args)
+    dataset = _subset_dataset_for_perturbation(
+        dataset,
+        max_samples=perturbation_input.max_samples,
+        seed=perturbation_input.seed,
+    )
+    if not dataset:
+        raise ValueError("No samples available for perturbation evaluation.")
+
+    src = torch.LongTensor([sample[0] for sample in dataset])
+    seg = torch.LongTensor([sample[2] for sample in dataset])
+
+    baseline_embeddings = _encode_src_seg_tensors(
+        model,
+        src,
+        seg,
+        batch_size=args.batch_size,
+        device=args.device,
+        pooling=args.pooling,
+        show_progress=show_progress,
+    )
+
+    masks = perturbation_input.masks or _default_perturbation_masks(args.seq_length)
+    vocab_size = len(args.tokenizer.vocab)
+
+    results = {}
+    for mask_name, mask_np in masks.items():
+        mask_tensor = torch.as_tensor(mask_np, dtype=torch.bool)
+        if mask_tensor.numel() != args.seq_length:
+            raise ValueError(
+                f"Mask `{mask_name}` has length {mask_tensor.numel()}, "
+                f"expected {args.seq_length}."
+            )
+
+        reorder_generator = torch.Generator().manual_seed(perturbation_input.seed)
+        random_generator = torch.Generator().manual_seed(perturbation_input.seed + 1)
+
+        reordered_src = _apply_reorder_perturbation(
+            src,
+            mask_tensor,
+            generator=reorder_generator,
+        )
+        random_src = _apply_random_perturbation(
+            src,
+            mask_tensor,
+            vocab_size=vocab_size,
+            generator=random_generator,
+        )
+
+        reordered_embeddings = _encode_src_seg_tensors(
+            model,
+            reordered_src,
+            seg,
+            batch_size=args.batch_size,
+            device=args.device,
+            pooling=args.pooling,
+            show_progress=show_progress,
+        )
+        random_embeddings = _encode_src_seg_tensors(
+            model,
+            random_src,
+            seg,
+            batch_size=args.batch_size,
+            device=args.device,
+            pooling=args.pooling,
+            show_progress=show_progress,
+        )
+
+        results[mask_name] = {
+            "reorder_cosine_similarity": float(
+                F.cosine_similarity(reordered_embeddings, baseline_embeddings, dim=1).mean().item()
+            ),
+            "random_cosine_similarity": float(
+                F.cosine_similarity(random_embeddings, baseline_embeddings, dim=1).mean().item()
+            ),
+            "perturbed_fraction": float(mask_tensor.float().mean().item()),
+            "sample_count": float(src.size(0)),
+        }
+
+    return results
 
 
 # ============================================================================
@@ -684,6 +937,7 @@ class IntrinsicEvaluationFramework:
         compute_cka_cic: bool = True,
         compute_causal_sensitivity: bool = True,
         compute_synth_math: bool = True,
+        compute_perturbation: bool = False,
         id_maxk: int = 100,
         verbose: bool = True
     ):
@@ -695,6 +949,7 @@ class IntrinsicEvaluationFramework:
             compute_cka_cic: Whether to compute CKA with CIC features
             compute_causal_sensitivity: Whether to compute causal sensitivity
             compute_synth_math: Whether to compute synth math tests
+            compute_perturbation: Whether to compute perturbation sensitivity
             id_maxk: Max neighbors for intrinsic dimensionality
             verbose: Whether to print progress information
         """
@@ -703,6 +958,7 @@ class IntrinsicEvaluationFramework:
         self.compute_cka_cic = compute_cka_cic
         self.compute_causal_sensitivity = compute_causal_sensitivity
         self.compute_synth_math = compute_synth_math
+        self.compute_perturbation = compute_perturbation
         self.id_maxk = id_maxk
         self.verbose = verbose
     
@@ -715,6 +971,7 @@ class IntrinsicEvaluationFramework:
         self,
         datasets: List[DatasetInput],
         synth_datasets: Optional[List[SynthDatasetEmbeddings]] = None,
+        perturbation_inputs: Optional[List[PerturbationEvaluationInput]] = None,
     ) -> EvaluationResults:
         """Run all enabled evaluations on the provided datasets.
         
@@ -725,6 +982,7 @@ class IntrinsicEvaluationFramework:
             EvaluationResults object containing all computed metrics
         """
         synth_datasets = synth_datasets or []
+        perturbation_inputs = perturbation_inputs or []
         results = EvaluationResults()
         
         # 1. Cosine Anisotropy (per dataset)
@@ -779,6 +1037,23 @@ class IntrinsicEvaluationFramework:
             for ds in synth_datasets:
                 math_results = _compute_synth_math(ds)
                 results.synth_math_results[ds.dataset_name] = math_results
+
+        # 6. Perturbation Sensitivity
+        if self.compute_perturbation:
+            self._log("Computing perturbation sensitivity...")
+            results.perturbation_sensitivity = {}
+            for perturb_input in tqdm(
+                perturbation_inputs,
+                desc="Perturbation",
+                disable=not self.verbose,
+            ):
+                perturb_results = _compute_perturbation_sensitivity(
+                    perturb_input,
+                    show_progress=self.verbose,
+                )
+                name_prefix = f"{perturb_input.dataset_name}/" if len(perturbation_inputs) > 1 else ""
+                for mask_name, metric_values in perturb_results.items():
+                    results.perturbation_sensitivity[f"{name_prefix}{mask_name}"] = metric_values
         
         self._log("Evaluation complete!")
         return results

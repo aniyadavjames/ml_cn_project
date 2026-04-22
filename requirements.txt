@@ -9,3 +9,4 @@ jupyterlab>=3.0.0
 dadapy>=0.1.0
 sentencepiece>=0.1.91
 six>=1.16.0
+flowcontainer>=7.4
