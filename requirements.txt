@@ -1,0 +1,16 @@
++ # Core numerical and machine learning libraries
++ torch>=1.10.0 # Adjust to your specific CUDA/PyTorch version on HPC
++ numpy>=1.20.0
++ scikit-learn>=1.0.0
++
++ # Data analysis and visualization (from original context)
++ jupyterlab>=3.0.0
++ pandas>=1.3.0
++ matplotlib>=3.4.0
++ seaborn>=0.11.0
++
++ # Utility libraries
++ tqdm>=4.60.0
++ dadapy>=0.1.0 # For intrinsic dimensionality (used in run_evaluation.py)
++ sentencepiece>=0.1.91 # Required by some ET-BERT tokenizers if spm_model_path is used
++ six>=1.16.0 # For Python 2/3 compatibility (used in ET-BERT tokenizers)
